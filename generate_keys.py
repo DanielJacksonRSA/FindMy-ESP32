@@ -1,51 +1,35 @@
-#!/usr/bin/env python
-import sys
+#!/usr/bin/env python3
+"""Generate the EC key pairs used by the ESP32 Find My tag.
+
+For each tag the script makes one SECP224R1 private key. The matching
+public key is what the tag broadcasts, so the owner can look the tag up in
+Apple's Find My network while anyone who sees the broadcast cannot link it
+to the owner.
+
+Usage:
+    python3 generate_keys.py --nkeys 20 --emit-firmware > firmware/public_keys.h
+
+Output goes to ./output by default:
+    <prefix>_keyfile        binary advertisement keys, one after another
+    <prefix>.keys           human-readable key list (private + public + hash)
+    <prefix>_devices.json   ready-to-import entry for OpenHaystack/WebHaystack
+    <prefix>_public.h       C array for the firmware, with --emit-firmware
+
+Keys are secrets. Do not commit the output folder.
+"""
+
+import argparse
 import base64
 import hashlib
-import random
-from cryptography.hazmat.primitives.asymmetric import ec
-from cryptography.hazmat.backends import default_backend
-import argparse
-import shutil
 import os
-import string
-from string import Template
+import secrets
 import struct
+import json
 
-OUTPUT_FOLDER = 'output/'
-TEMPLATE = Template('{'
-                    '\"id\": $id,'
-                    '\"colorComponents\": ['
-                    '    0,'
-                    '    1,'
-                    '    0,'
-                    '    1'
-                    '],'
-                    '\"name\": \"$name\",'
-                    '\"privateKey\": \"$privateKey\",'
-                    '\"icon\": \"\",'
-                    '\"isActive\": true,'
-                    '\"additionalKeys\": [$additionalKeys]'
-                    '}')
+from cryptography.hazmat.backends import default_backend
+from cryptography.hazmat.primitives.asymmetric import ec
 
-
-def int_to_bytes(n, length, endianess='big'):
-    h = '%x' % n
-    s = ('0'*(len(h) % 2) + h).zfill(length*2).decode('hex')
-    return s if endianess == 'big' else s[::-1]
-
-
-def to_C_byte_array(adv_key, isV3):
-    out = '{'
-    for element in range(0, len(adv_key)):
-        e = adv_key[element] if isV3 else ord(adv_key[element])
-        out = out + "0x{:02x}".format(e)
-        if element != len(adv_key)-1:
-            out = out + ','
-
-    out = out + '}'
-    return out
-
+OUTPUT_FOLDER = "output"
 
 def sha256(data):
     digest = hashlib.new("sha256")
@@ -53,122 +37,102 @@ def sha256(data):
     return digest.digest()
 
 
-parser = argparse.ArgumentParser()
-parser.add_argument(
-    '-n', '--nkeys', help='number of keys to generate', type=int, default=1)
-parser.add_argument('-p', '--prefix', help='prefix of the keyfiles')
-parser.add_argument(
-    '-y', '--yaml', help='yaml file where to write the list of generated keys')
-parser.add_argument(
-    '-v', '--verbose', help='print keys as they are generated', action="store_true")
-parser.add_argument(
-
-    '-tinfs', '--thisisnotforstalking', help=argparse.SUPPRESS)   
-
-args = parser.parse_args()
-
-MAX_KEYS = 1
-
-if (args.thisisnotforstalking == 'i_agree'):
-    MAX_KEYS = 50
-
- 
-if args.nkeys < 1 or args.nkeys > MAX_KEYS:
-    raise argparse.ArgumentTypeError(
-        "Number of keys out of range (between 1 and " + str(MAX_KEYS) + ")")
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description="Generate Find My key pairs for the ESP32 firmware.")
+    parser.add_argument("-n", "--nkeys", type=int, default=1,
+                        help="number of keys to generate (1-50)")
+    parser.add_argument("-p", "--prefix",
+                        help="prefix of the key files (default: 6 random characters)")
+    parser.add_argument("-o", "--output", default=OUTPUT_FOLDER,
+                        help="output folder (default: %(default)s)")
+    parser.add_argument("--emit-firmware", action="store_true",
+                        help="also write <prefix>_public.h with a C array of the "
+                             "public keys for the firmware")
+    parser.add_argument("-v", "--verbose", action="store_true",
+                        help="print keys as they are generated")
+    return parser.parse_args()
 
 
-current_directory = os.getcwd()
-final_directory = os.path.join(current_directory, OUTPUT_FOLDER)
+def main():
+    args = parse_args()
 
-if os.path.exists(OUTPUT_FOLDER):
-    shutil.rmtree(OUTPUT_FOLDER)
+    if args.nkeys < 1 or args.nkeys > 50:
+        raise SystemExit("Number of keys out of range (between 1 and 50)")
 
-os.mkdir(final_directory)
+    outdir = os.path.abspath(args.output)
+    os.makedirs(outdir, exist_ok=True)
 
+    prefix = args.prefix or "".join(
+        secrets.choice("ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789") for _ in range(6))
 
-prefix = ''
+    keys = []  # (private_b64, public_b64, hashed_b64)
+    while len(keys) < args.nkeys:
+        priv = secrets.randbits(224)
+        pub_x = ec.derive_private_key(
+            priv, ec.SECP224R1(), default_backend()).public_key().public_numbers().x
 
-if args.prefix is None:
-    prefix = ''.join(random.choice(string.ascii_uppercase +
-                     string.digits) for _ in range(6))
-else:
-    prefix = args.prefix
+        priv_bytes = priv.to_bytes(28, "big")
+        pub_bytes = pub_x.to_bytes(28, "big")
 
-if args.yaml:
-    yaml = open(OUTPUT_FOLDER + prefix + '_' + args.yaml + '.yaml', 'w')
-    yaml.write('  keys:\n')
+        hashed_b64 = base64.b64encode(sha256(pub_bytes)).decode("ascii")
+        if "/" in hashed_b64[:7]:
+            # Haystack looks the tag up by this base64 prefix; a '/' would
+            # break the URL, so roll again.
+            continue
 
+        keys.append((base64.b64encode(priv_bytes).decode("ascii"),
+                     base64.b64encode(pub_bytes).decode("ascii"),
+                     hashed_b64))
 
-keyfile = open(OUTPUT_FOLDER + prefix + '_keyfile', 'wb')
+    keyfile_path = os.path.join(outdir, prefix + "_keyfile")
+    with open(keyfile_path, "wb") as f:
+        f.write(struct.pack("B", args.nkeys))
+        for _, pub_b64, _ in keys:
+            f.write(base64.b64decode(pub_b64))
 
-keyfile.write(struct.pack("B", args.nkeys))
+    keys_path = os.path.join(outdir, prefix + ".keys")
+    with open(keys_path, "w") as f:
+        for priv_b64, pub_b64, hashed_b64 in keys:
+            f.write("Private key: %s\n" % priv_b64)
+            f.write("Advertisement key: %s\n" % pub_b64)
+            f.write("Hashed adv key: %s\n\n" % hashed_b64)
 
-devices = open(OUTPUT_FOLDER + prefix + '_devices.json', 'w')
-devices.write('[\n')
+    # The last private key is the main one; the rest are fallbacks.
+    device = {
+        "id": str(secrets.randbelow(10000000)),
+        "colorComponents": [0, 1, 0, 1],
+        "name": prefix,
+        "privateKey": keys[-1][0],
+        "icon": "",
+        "isActive": True,
+        "additionalKeys": [priv for priv, _, _ in keys[:-1]],
+    }
+    devices_path = os.path.join(outdir, prefix + "_devices.json")
+    with open(devices_path, "w") as f:
+        json.dump([device], f, indent=2)
+        f.write("\n")
 
-fname = '%s.keys' % (prefix)
-keys = open(OUTPUT_FOLDER + fname, 'w')
+    if args.emit_firmware:
+        header_path = os.path.join(outdir, prefix + "_public.h")
+        with open(header_path, "w") as f:
+            f.write("// Generated by generate_keys.py. Public keys only.\n")
+            f.write("const int NUM_KEYS = %d;\n" % args.nkeys)
+            f.write("const uint8_t publicKeys[NUM_KEYS][28] = {\n")
+            for _, pub_b64, _ in keys:
+                row = ", ".join("0x%02x" % b for b in base64.b64decode(pub_b64))
+                f.write("  {%s},\n" % row)
+            f.write("};\n")
 
-
-isV3 = sys.version_info.major > 2
-print('Using python3' if isV3 else 'Using python2')
-print(f'Output will be written to {OUTPUT_FOLDER}')
-additionalKeys = []
-i = 0
-while i < args.nkeys:
-    priv = random.getrandbits(224)
-    adv = ec.derive_private_key(priv, ec.SECP224R1(
-    ), default_backend()).public_key().public_numbers().x
-    if isV3:
-        priv_bytes = priv.to_bytes(28, 'big')
-        adv_bytes = adv.to_bytes(28, 'big')
-    else:
-        priv_bytes = int_to_bytes(priv, 28)
-        adv_bytes = int_to_bytes(adv, 28)
-
-    priv_b64 = base64.b64encode(priv_bytes).decode("ascii")
-    adv_b64 = base64.b64encode(adv_bytes).decode("ascii")
-    s256_b64 = base64.b64encode(sha256(adv_bytes)).decode("ascii")
-
-    if '/' in s256_b64[:7]:
-        print(
-            'Key skipped and regenerated, because there was a / in the b64 of the hashed pubkey :(')
-        continue
-    else:
-        i += 1
-
-    keyfile.write(base64.b64decode(adv_b64))
-
-    if i < args.nkeys:
-        additionalKeys.append(priv_b64)  # The last one is the leading one
+    print("Wrote %d key(s) to %s" % (args.nkeys, outdir))
+    for path in (keyfile_path, keys_path, devices_path):
+        print(" ", path)
 
     if args.verbose:
-        print('%d)' % (i+1))
-        print('Private key: %s' % priv_b64)
-        print('Advertisement key: %s' % adv_b64)
-        print('Hashed adv key: %s' % s256_b64)
-
-    if '/' in s256_b64[:7]:
-        print(
-            'no key file written, there was a / in the b64 of the hashed pubkey :(')
-    else:
-        keys.write('Private key: %s\n' % priv_b64)
-        keys.write('Advertisement key: %s\n' % adv_b64)
-        keys.write('Hashed adv key: %s\n' % s256_b64)
-        if args.yaml:
-            yaml.write('    - "%s"\n' % adv_b64)
-
-addKeysS = ''
-if (len(additionalKeys) > 0):
-    addKeysS = "\"" + "\",\"".join(additionalKeys) + "\""
+        for i, (priv_b64, pub_b64, hashed_b64) in enumerate(keys, 1):
+            print("%d) Private: %s  Advertisement: %s  Hash: %s"
+                  % (i, priv_b64, pub_b64, hashed_b64))
 
 
-devices.write(TEMPLATE.substitute(name=prefix,
-                                  id=str(random.choice(
-                                      range(0, 10000000))),
-                                  privateKey=priv_b64,
-                                  additionalKeys=addKeysS
-                                  ))
-
-devices.write(']')
+if __name__ == "__main__":
+    main()

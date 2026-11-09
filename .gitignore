@@ -1,0 +1,18 @@
+# Never commit key material or generated keys.
+output/
+firmware/public_keys.h
+*_public.h
+*.keys
+*_keyfile
+*_devices.json
+
+# Python
+__pycache__/
+venv/
+.venv/
+*.egg-info/
+
+# OS / editor
+.DS_Store
+.vscode/
+.idea/
