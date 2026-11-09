@@ -1,4 +1,4 @@
-# Never commit key material or generated keys.
+# Generated keys - never commit real key material.
 output/
 firmware/public_keys.h
 *_public.h
