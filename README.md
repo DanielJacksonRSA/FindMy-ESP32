@@ -68,16 +68,14 @@ python scan.py
 
 Prints any Apple BLE packets it hears, including your tag's. The tag is also visible in a normal Find My or OpenHaystack lookup using the generated keys.
 
-## Improvements made for this portfolio
+## Design notes
 
-The original scripts were quick prototypes. For this repository I:
-
-- Replaced `random.getrandbits` with the cryptographically secure `secrets` module. Key material should never come from a PRNG seeded from the clock.
-- Removed a hidden `--thisisnotforstalking` flag that lifted the key limit, and kept the limit honest at 50.
-- Removed Python 2 leftovers (`.decode('hex')`, `ord()` branches) and made the script Python 3 only.
-- Replaced the hand-built JSON string template with `json.dumps`, so the devices file is valid by construction.
-- Added `--emit-firmware` so the C header of public keys is generated instead of hand-copied into the sketch.
-- Moved the 20 real keys out of the firmware source into the git-ignored `public_keys.h`. The original sketch had them hardcoded.
+- Key material comes from the cryptographically secure `secrets` module, never from a PRNG seeded from the clock.
+- The key count is capped at 50.
+- The script is Python 3 only.
+- The devices file is written with `json.dumps`, so it is valid by construction.
+- `--emit-firmware` generates the C header of public keys instead of hand-copying them into the sketch.
+- Real keys live in the git-ignored `public_keys.h`, not in the firmware source.
 
 ## Attribution
 
